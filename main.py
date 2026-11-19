@@ -1,14 +1,14 @@
 import os
+import json
 import sqlite3
 from fastapi import FastAPI, Request, Response, Query
 import httpx
-from google import genai
-from google.genai import types
+from groq import Groq
 from twilio.twiml.voice_response import VoiceResponse, Gather
 
 app = FastAPI()
 
-# --- ডেটাবেস সেটআপ (SQLite) ---
+# --- ১. ডেটাবেস সেটআপ (SQLite) ---
 def init_db():
     conn = sqlite3.connect("appointments.db")
     c = conn.cursor()
@@ -35,9 +35,8 @@ DOCTORS = {
     "ডাঃ দাস (হৃদরোগ বিশেষজ্ঞ)": ["সকাল ১১:৩০", "দুপুর ৩:০০"]
 }
 
-# --- AI ফাংশন টুলস ---
+# --- ২. বুকিং ও স্লট চেক ফাংশন ---
 def check_available_slots(doctor_name: str, date: str) -> str:
-    """কোনো নির্দিষ্ট তারিখে ডাক্তারের ফাঁকা সময় চেক করে।"""
     matched_doc = next((d for d in DOCTORS if doctor_name.lower() in d.lower()), None)
     if not matched_doc:
         return f"এই ডাক্তারকে পাওয়া যায়নি। আমাদের ডাক্তারগণ: {', '.join(DOCTORS.keys())}"
@@ -55,7 +54,6 @@ def check_available_slots(doctor_name: str, date: str) -> str:
 
 
 def book_appointment(patient_name: str, phone: str, doctor_name: str, date: str, time_slot: str, channel: str = "WhatsApp") -> str:
-    """রোগীর ডাক্তার অ্যাপয়েন্টমেন্ট কনফার্ম ও সেভ করে।"""
     matched_doc = next((d for d in DOCTORS if doctor_name.lower() in d.lower()), None)
     if not matched_doc:
         return "বুকিং হয়নি: সঠিক ডাক্তারের নাম বলুন।"
@@ -80,43 +78,159 @@ def book_appointment(patient_name: str, phone: str, doctor_name: str, date: str,
     return f"বুকিং কনফার্ম হয়েছে! আইডি: #{booking_id}, রোগী: {patient_name}, ডাক্তার: {matched_doc}, তারিখ: {date}, সময়: {time_slot}।"
 
 
-# --- Gemini AI চ্যাট ---
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-user_sessions = {}
+# --- ৩. Groq AI ও টুলস সেটআপ ---
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "check_available_slots",
+            "description": "কোনো নির্দিষ্ট তারিখে ডাক্তারের ফাঁকা সময় চেক করে।",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "doctor_name": {"type": "string", "description": "ডাক্তারের নাম"},
+                    "date": {"type": "string", "description": "তারিখ (যেমন: 20-11-2026)"}
+                },
+                "required": ["doctor_name", "date"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "book_appointment",
+            "description": "রোগীর ডাক্তার অ্যাপয়েন্টমেন্ট কনফার্ম ও ডেটাবেসে সেভ করে।",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "patient_name": {"type": "string", "description": "রোগীর নাম"},
+                    "phone": {"type": "string", "description": "রোগীর ফোন নম্বর"},
+                    "doctor_name": {"type": "string", "description": "ডাক্তারের নাম"},
+                    "date": {"type": "string", "description": "তারিখ"},
+                    "time_slot": {"type": "string", "description": "সময় (যেমন: সকাল ১০:০০)"}
+                },
+                "required": ["patient_name", "doctor_name", "date", "time_slot"]
+            }
+        }
+    }
+]
 
 SYSTEM_PROMPT = f"""
 তুমি একজন ভদ্র ক্লিনিক রিসেপশনিস্ট AI। রোগীদের ডাক্তার বুক করতে সাহায্য করো।
 আমাদের ডাক্তারগণ: {', '.join(DOCTORS.keys())}।
 নিয়ম:
-১. রোগী যে ভাষায় বলবে (বাংলা বা ইংরেজি), সেই ভাষায় সহজ ও সংক্ষিপ্ত উত্তর দাও।
-২. বুকিং করার আগে রোগীর নাম, ডাক্তারের নাম, তারিখ এবং সময় জেনে নাও।
+১. রোগী যে ভাষায় বলবে (বাংলা, বাংলিশ বা ইংরেজি), সেই ভাষায় সহজ ও সংক্ষিপ্ত উত্তর দাও।
+২. বুকিং করার আগে অবশ্যই জেনে নাও: রোগীর নাম, ডাক্তারের নাম, তারিখ এবং সময়।
 ৩. প্রথমে check_available_slots দিয়ে ফাঁকা সময় চেক করে তারপর book_appointment দিয়ে বুক করো।
-৪. ফোন কলের ক্ষেত্রে ১-২ লাইনে উত্তর দাও এবং কোনো স্টার (*) চিহ্ন ব্যবহার করবে না।
+৪. ফোন কলের ক্ষেত্রে উত্তর ১-২ লাইনের মধ্যে রাখবে এবং কোনো স্টার (*) চিহ্ন ব্যবহার করবে না।
 """
 
+user_sessions = {}
+MODEL_NAME = "llama-3.3-70b-versatile"
+
+
 def ask_ai(session_id: str, user_message: str, channel: str, phone: str) -> str:
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        return "সার্ভারে GROQ_API_KEY সেট করা নেই। Render-এর Environment Variables চেক করুন।"
+
+    client = Groq(api_key=api_key)
+
     if session_id not in user_sessions:
-        user_sessions[session_id] = client.chats.create(
-            model="gemini-2.5-flash",
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                tools=[check_available_slots, book_appointment],
-                temperature=0.3
-            )
+        user_sessions[session_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    messages = user_sessions[session_id]
+    messages.append({
+        "role": "user",
+        "content": f"[Channel: {channel}, User Phone: {phone}] রোগী বলল: {user_message}"
+    })
+
+    # মেমোরি ঠিক রাখতে শেষ ২০টি মেসেজ রাখা
+    if len(messages) > 21:
+        messages = [messages[0]] + messages[-20:]
+        user_sessions[session_id] = messages
+
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=messages,
+            tools=TOOLS,
+            tool_choice="auto",
+            temperature=0.3,
+            max_tokens=300
         )
-    chat = user_sessions[session_id]
-    prompt = f"[Channel: {channel}, User Phone: {phone}] রোগী বলল: {user_message}"
-    response = chat.send_message(prompt)
-    return response.text or "দুঃখিত, বুঝতে পারিনি। দয়া করে আবার বলুন।"
+
+        response_msg = response.choices[0].message
+
+        # AI যদি কোনো টুল কল করতে চায়
+        if response_msg.tool_calls:
+            messages.append({
+                "role": "assistant",
+                "content": response_msg.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments
+                        }
+                    }
+                    for tc in response_msg.tool_calls
+                ]
+            })
+
+            for tc in response_msg.tool_calls:
+                args = json.loads(tc.function.arguments or "{}")
+                if tc.function.name == "check_available_slots":
+                    result = check_available_slots(
+                        doctor_name=args.get("doctor_name", ""),
+                        date=args.get("date", "")
+                    )
+                elif tc.function.name == "book_appointment":
+                    result = book_appointment(
+                        patient_name=args.get("patient_name", "Unknown"),
+                        phone=args.get("phone") or phone,
+                        doctor_name=args.get("doctor_name", ""),
+                        date=args.get("date", ""),
+                        time_slot=args.get("time_slot", ""),
+                        channel=channel
+                    )
+                else:
+                    result = "অজানা ফাংশন।"
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "name": tc.function.name,
+                    "content": result
+                })
+
+            final_response = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=messages,
+                temperature=0.3,
+                max_tokens=300
+            )
+            final_text = final_response.choices[0].message.content or "ধন্যবাদ!"
+        else:
+            final_text = response_msg.content or "দুঃখিত, বুঝতে পারিনি। দয়া করে আবার বলুন।"
+
+        messages.append({"role": "assistant", "content": final_text})
+        return final_text
+
+    except Exception as e:
+        print("Groq Error:", e)
+        return "দুঃখিত, এই মুহূর্তে একটু টেকনিক্যাল সমস্যা হচ্ছে। কিছুক্ষণ পর আবার চেষ্টা করুন।"
 
 
-# --- সার্ভার চালু আছে কিনা দেখার লিংক (Render Health Check) ---
+# --- ৪. Render Health Check ---
 @app.get("/")
 async def home():
-    return {"status": "Doctor Booking AI (WhatsApp & Call) লাইভ আছে!"}
+    return {"status": "Doctor Booking AI (Groq + WhatsApp + Call) লাইভ আছে!"}
 
 
-# --- WhatsApp এন্ডপয়েন্ট ---
+# --- ৫. WhatsApp এন্ডপয়েন্ট ---
 @app.get("/whatsapp")
 async def verify_whatsapp(
     hub_mode: str = Query(None, alias="hub.mode"),
@@ -162,7 +276,7 @@ async def send_whatsapp_message(to_phone: str, text: str):
         await http_client.post(url, headers=headers, json=payload)
 
 
-# --- Twilio ফোন কল এন্ডপয়েন্ট ---
+# --- ৬. Twilio ফোন কল এন্ডপয়েন্ট ---
 @app.post("/voice")
 async def incoming_call():
     vr = VoiceResponse()
