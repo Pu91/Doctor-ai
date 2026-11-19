@@ -1,10 +1,10 @@
 import os
 import json
 import sqlite3
-from fastapi import FastAPI, Request, Response, Query
-import httpx
+from fastapi import FastAPI, Request, Response
 from groq import Groq
 from twilio.twiml.voice_response import VoiceResponse, Gather
+from twilio.twiml.messaging_response import MessagingResponse
 
 app = FastAPI()
 
@@ -132,7 +132,7 @@ MODEL_NAME = "llama-3.3-70b-versatile"
 def ask_ai(session_id: str, user_message: str, channel: str, phone: str) -> str:
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
-        return "সার্ভারে GROQ_API_KEY সেট করা নেই। Render-এর Environment Variables চেক করুন।"
+        return "সার্ভারে GROQ_API_KEY সেট করা নেই। Render-এর Environment চেক করুন।"
 
     client = Groq(api_key=api_key)
 
@@ -145,7 +145,6 @@ def ask_ai(session_id: str, user_message: str, channel: str, phone: str) -> str:
         "content": f"[Channel: {channel}, User Phone: {phone}] রোগী বলল: {user_message}"
     })
 
-    # মেমোরি ঠিক রাখতে শেষ ২০টি মেসেজ রাখা
     if len(messages) > 21:
         messages = [messages[0]] + messages[-20:]
         user_sessions[session_id] = messages
@@ -162,7 +161,6 @@ def ask_ai(session_id: str, user_message: str, channel: str, phone: str) -> str:
 
         response_msg = response.choices[0].message
 
-        # AI যদি কোনো টুল কল করতে চায়
         if response_msg.tool_calls:
             messages.append({
                 "role": "assistant",
@@ -221,62 +219,31 @@ def ask_ai(session_id: str, user_message: str, channel: str, phone: str) -> str:
 
     except Exception as e:
         print("Groq Error:", e)
-        return "দুঃখিত, এই মুহূর্তে একটু টেকনিক্যাল সমস্যা হচ্ছে। কিছুক্ষণ পর আবার চেষ্টা করুন।"
+        return "দুঃখিত, একটু টেকনিক্যাল সমস্যা হচ্ছে। কিছুক্ষণ পর আবার চেষ্টা করুন।"
 
 
 # --- ৪. Render Health Check ---
 @app.get("/")
 async def home():
-    return {"status": "Doctor Booking AI (Groq + WhatsApp + Call) লাইভ আছে!"}
+    return {"status": "Doctor Booking AI (Groq + Twilio WhatsApp & Call) লাইভ আছে!"}
 
 
-# --- ৫. WhatsApp এন্ডপয়েন্ট ---
-@app.get("/whatsapp")
-async def verify_whatsapp(
-    hub_mode: str = Query(None, alias="hub.mode"),
-    hub_verify_token: str = Query(None, alias="hub.verify_token"),
-    hub_challenge: str = Query(None, alias="hub.challenge")
-):
-    if hub_mode == "subscribe" and hub_verify_token == os.getenv("VERIFY_TOKEN"):
-        return Response(content=hub_challenge, media_type="text/plain")
-    return Response(content="Forbidden", status_code=403)
-
-
+# --- ৫. Twilio WhatsApp এন্ডপয়েন্ট ---
 @app.post("/whatsapp")
-async def whatsapp_webhook(request: Request):
-    data = await request.json()
-    try:
-        entry = data["entry"][0]["changes"][0]["value"]
-        if "messages" in entry:
-            msg = entry["messages"][0]
-            sender_phone = msg["from"]
-            text_body = msg.get("text", {}).get("body", "")
+async def twilio_whatsapp(request: Request):
+    form = await request.form()
+    sender_raw = form.get("From", "Unknown")
+    sender_phone = sender_raw.replace("whatsapp:", "")
+    user_msg = form.get("Body", "").strip()
 
-            if text_body:
-                reply_text = ask_ai(f"wa_{sender_phone}", text_body, "WhatsApp", sender_phone)
-                await send_whatsapp_message(sender_phone, reply_text)
-    except (KeyError, IndexError):
-        pass
-    return {"status": "ok"}
+    resp = MessagingResponse()
+    if user_msg:
+        reply_text = ask_ai(f"wa_{sender_phone}", user_msg, "WhatsApp", sender_phone)
+        resp.message(reply_text)
+    return Response(content=str(resp), media_type="application/xml")
 
 
-async def send_whatsapp_message(to_phone: str, text: str):
-    url = f"https://graph.facebook.com/v21.0/{os.getenv('WHATSAPP_PHONE_ID')}/messages"
-    headers = {
-        "Authorization": f"Bearer {os.getenv('WHATSAPP_TOKEN')}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to_phone,
-        "type": "text",
-        "text": {"body": text}
-    }
-    async with httpx.AsyncClient() as http_client:
-        await http_client.post(url, headers=headers, json=payload)
-
-
-# --- ৬. Twilio ফোন কল এন্ডপয়েন্ট ---
+# --- ৬. Twilio Phone Call এন্ডপয়েন্ট ---
 @app.post("/voice")
 async def incoming_call():
     vr = VoiceResponse()
