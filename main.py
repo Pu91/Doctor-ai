@@ -1,8 +1,9 @@
 import os
 import json
 import sqlite3
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response, BackgroundTasks
 from groq import Groq
+from twilio.rest import Client as TwilioClient
 from twilio.twiml.voice_response import VoiceResponse, Gather
 from twilio.twiml.messaging_response import MessagingResponse
 
@@ -130,7 +131,6 @@ ACTIVE_MODEL = None
 
 
 def get_active_model(client: Groq) -> str:
-    """আপনার Groq অ্যাকাউন্টে চালু থাকা সেরা চ্যাট মডেলটি নিজে থেকেই খুঁজে নেয়।"""
     global ACTIVE_MODEL
     env_model = os.getenv("GROQ_MODEL")
     if env_model:
@@ -140,7 +140,6 @@ def get_active_model(client: Groq) -> str:
 
     models_resp = client.models.list()
     all_ids = [m.id for m in models_resp.data]
-    print("Available Groq Models:", all_ids)
 
     blocked = ("whisper", "tts", "guard", "playai", "embed", "rerank", "orpheus", "safeguard", "distil", "compound")
     chat_models = [m for m in all_ids if not any(b in m.lower() for b in blocked)]
@@ -163,7 +162,6 @@ def get_active_model(client: Groq) -> str:
 
     if chat_models:
         ACTIVE_MODEL = chat_models[0]
-        print("Fallback Groq Model:", ACTIVE_MODEL)
         return ACTIVE_MODEL
 
     raise RuntimeError(f"No usable chat model found. Available: {all_ids}")
@@ -275,16 +273,29 @@ def ask_ai(session_id: str, user_message: str, channel: str, phone: str) -> str:
         return "দুঃখিত, একটু টেকনিক্যাল সমস্যা হচ্ছে। কিছুক্ষণ পর আবার চেষ্টা করুন।"
 
 
+def send_whatsapp_via_api(from_wa: str, to_wa: str, clean_phone: str, user_msg: str):
+    """ব্যাকগ্রাউন্ডে AI-এর উত্তর তৈরি করে সরাসরি Twilio API দিয়ে WhatsApp-এ পাঠায়।"""
+    try:
+        reply_text = ask_ai(f"wa_{clean_phone}", user_msg, "WhatsApp", clean_phone)
+        print(f"WhatsApp Out -> {reply_text}")
+
+        sid = os.getenv("TWILIO_ACCOUNT_SID")
+        token = os.getenv("TWILIO_AUTH_TOKEN")
+        twilio_client = TwilioClient(sid, token)
+        sent = twilio_client.messages.create(
+            from_=from_wa,
+            to=to_wa,
+            body=reply_text
+        )
+        print(f"Twilio API Sent OK -> SID: {sent.sid}")
+    except Exception as e:
+        print(f"Twilio API Send Error -> {e}")
+
+
 # --- ৪. হোম, এআই টেস্ট ও বুকিং লিস্ট ---
 @app.get("/")
 async def home():
-    return {"status": "Doctor Booking AI (Groq Auto-Model + Twilio) লাইভ আছে!"}
-
-
-@app.get("/test-ai")
-async def test_ai():
-    reply = ask_ai("browser_test", "Hi, kon kon doctor ache?", "Test", "0000")
-    return {"selected_model": ACTIVE_MODEL, "reply": reply}
+    return {"status": "Doctor Booking AI (Groq + Twilio API Direct) লাইভ আছে!"}
 
 
 @app.get("/bookings")
@@ -312,18 +323,30 @@ async def view_bookings():
 
 # --- ৫. Twilio WhatsApp এন্ডপয়েন্ট ---
 @app.post("/whatsapp")
-async def twilio_whatsapp(request: Request):
+async def twilio_whatsapp(request: Request, background_tasks: BackgroundTasks):
     form = await request.form()
-    sender_raw = form.get("From", "Unknown")
-    sender_phone = str(sender_raw).replace("whatsapp:", "")
+    from_raw = str(form.get("From", "")).strip()
+    to_raw = str(form.get("To", "")).strip()
     user_msg = str(form.get("Body", "")).strip()
-    print(f"WhatsApp In -> From: {sender_phone} | Body: {user_msg}")
 
+    print(f"WhatsApp In -> From: {from_raw} | To: {to_raw} | Body: {user_msg}")
+
+    if not user_msg:
+        return Response(content=str(MessagingResponse()), media_type="text/xml")
+
+    clean_phone = from_raw.replace("whatsapp:", "")
+
+    # Twilio API Key সেট থাকলে ব্যাকগ্রাউন্ডে সরাসরি মেসেজ পাঠাবে (টাইমআউট হবে না)
+    if os.getenv("TWILIO_ACCOUNT_SID") and os.getenv("TWILIO_AUTH_TOKEN"):
+        from_wa = to_raw if to_raw.startswith("whatsapp:") else f"whatsapp:{to_raw}"
+        to_wa = from_raw if from_raw.startswith("whatsapp:") else f"whatsapp:{from_raw}"
+        background_tasks.add_task(send_whatsapp_via_api, from_wa, to_wa, clean_phone, user_msg)
+        return Response(content=str(MessagingResponse()), media_type="text/xml")
+
+    # Fallback: API Key না থাকলে TwiML দিয়ে পাঠাবে
+    reply_text = ask_ai(f"wa_{clean_phone}", user_msg, "WhatsApp", clean_phone)
     resp = MessagingResponse()
-    if user_msg:
-        reply_text = ask_ai(f"wa_{sender_phone}", user_msg, "WhatsApp", sender_phone)
-        print(f"WhatsApp Out -> {reply_text}")
-        resp.message(reply_text)
+    resp.message(reply_text)
     return Response(content=str(resp), media_type="text/xml")
 
 
