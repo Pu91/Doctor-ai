@@ -28,18 +28,18 @@ def init_db():
 
 init_db()
 
-# ডাক্তার ও সময়সূচি
+# ডাক্তার ও সময়সূচি (ইচ্ছেমতো বদলে নিতে পারেন)
 DOCTORS = {
-    "ডাঃ সেন (জেনারেল ফিজিশিয়ান)": ["সকাল ১০:০০", "সকাল ১১:০০", "বিকাল ৫:০০"],
-    "ডাঃ রায় (দন্ত চিকিৎসক)": ["দুপুর ১২:০০", "বিকাল ৪:০০", "সন্ধ্যা ৬:০০"],
-    "ডাঃ দাস (হৃদরোগ বিশেষজ্ঞ)": ["সকাল ১১:৩০", "দুপুর ৩:০০"]
+    "Dr. Sen (General Physician)": ["10:00 AM", "11:00 AM", "05:00 PM"],
+    "Dr. Roy (Dentist)": ["12:00 PM", "04:00 PM", "06:00 PM"],
+    "Dr. Das (Cardiologist)": ["11:30 AM", "03:00 PM"]
 }
 
 # --- ২. বুকিং ও স্লট চেক ফাংশন ---
 def check_available_slots(doctor_name: str, date: str) -> str:
     matched_doc = next((d for d in DOCTORS if doctor_name.lower() in d.lower()), None)
     if not matched_doc:
-        return f"এই ডাক্তারকে পাওয়া যায়নি। আমাদের ডাক্তারগণ: {', '.join(DOCTORS.keys())}"
+        return f"Doctor not found. Available doctors: {', '.join(DOCTORS.keys())}"
 
     conn = sqlite3.connect("appointments.db")
     c = conn.cursor()
@@ -49,14 +49,14 @@ def check_available_slots(doctor_name: str, date: str) -> str:
 
     free_slots = [s for s in DOCTORS[matched_doc] if s not in booked]
     if not free_slots:
-        return f"{date} তারিখে {matched_doc}-এর কোনো স্লট খালি নেই।"
-    return f"{date} তারিখে {matched_doc}-এর ফাঁকা সময়: {', '.join(free_slots)}"
+        return f"No free slots for {matched_doc} on {date}."
+    return f"Available slots for {matched_doc} on {date}: {', '.join(free_slots)}"
 
 
 def book_appointment(patient_name: str, phone: str, doctor_name: str, date: str, time_slot: str, channel: str = "WhatsApp") -> str:
     matched_doc = next((d for d in DOCTORS if doctor_name.lower() in d.lower()), None)
     if not matched_doc:
-        return "বুকিং হয়নি: সঠিক ডাক্তারের নাম বলুন।"
+        return "Booking failed: Please choose a valid doctor."
 
     conn = sqlite3.connect("appointments.db")
     c = conn.cursor()
@@ -66,7 +66,7 @@ def book_appointment(patient_name: str, phone: str, doctor_name: str, date: str,
     )
     if c.fetchone():
         conn.close()
-        return f"দুঃখিত, {time_slot} স্লটটি আগেই বুক হয়ে গেছে।"
+        return f"Sorry, {time_slot} is already booked."
 
     c.execute(
         "INSERT INTO bookings (patient_name, phone, doctor, date, time_slot, channel) VALUES (?, ?, ?, ?, ?, ?)",
@@ -75,7 +75,7 @@ def book_appointment(patient_name: str, phone: str, doctor_name: str, date: str,
     booking_id = c.lastrowid
     conn.commit()
     conn.close()
-    return f"বুকিং কনফার্ম হয়েছে! আইডি: #{booking_id}, রোগী: {patient_name}, ডাক্তার: {matched_doc}, তারিখ: {date}, সময়: {time_slot}।"
+    return f"Booking Confirmed! ID: #{booking_id}, Patient: {patient_name}, Doctor: {matched_doc}, Date: {date}, Time: {time_slot}."
 
 
 # --- ৩. Groq AI ও টুলস সেটআপ ---
@@ -84,12 +84,12 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "check_available_slots",
-            "description": "কোনো নির্দিষ্ট তারিখে ডাক্তারের ফাঁকা সময় চেক করে।",
+            "description": "Check available appointment time slots for a doctor on a given date.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "doctor_name": {"type": "string", "description": "ডাক্তারের নাম"},
-                    "date": {"type": "string", "description": "তারিখ (যেমন: 20-11-2026)"}
+                    "doctor_name": {"type": "string", "description": "Name of the doctor, e.g., Dr. Sen"},
+                    "date": {"type": "string", "description": "Appointment date, e.g., 20-11-2026"}
                 },
                 "required": ["doctor_name", "date"]
             }
@@ -99,15 +99,15 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "book_appointment",
-            "description": "রোগীর ডাক্তার অ্যাপয়েন্টমেন্ট কনফার্ম ও ডেটাবেসে সেভ করে।",
+            "description": "Confirm and save a patient's doctor appointment in the database.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "patient_name": {"type": "string", "description": "রোগীর নাম"},
-                    "phone": {"type": "string", "description": "রোগীর ফোন নম্বর"},
-                    "doctor_name": {"type": "string", "description": "ডাক্তারের নাম"},
-                    "date": {"type": "string", "description": "তারিখ"},
-                    "time_slot": {"type": "string", "description": "সময় (যেমন: সকাল ১০:০০)"}
+                    "patient_name": {"type": "string", "description": "Patient full name"},
+                    "phone": {"type": "string", "description": "Patient phone number"},
+                    "doctor_name": {"type": "string", "description": "Doctor name"},
+                    "date": {"type": "string", "description": "Appointment date"},
+                    "time_slot": {"type": "string", "description": "Selected time slot, e.g., 10:00 AM"}
                 },
                 "required": ["patient_name", "doctor_name", "date", "time_slot"]
             }
@@ -116,13 +116,13 @@ TOOLS = [
 ]
 
 SYSTEM_PROMPT = f"""
-তুমি একজন ভদ্র ক্লিনিক রিসেপশনিস্ট AI। রোগীদের ডাক্তার বুক করতে সাহায্য করো।
-আমাদের ডাক্তারগণ: {', '.join(DOCTORS.keys())}।
-নিয়ম:
-১. রোগী যে ভাষায় বলবে (বাংলা, বাংলিশ বা ইংরেজি), সেই ভাষায় সহজ ও সংক্ষিপ্ত উত্তর দাও।
-২. বুকিং করার আগে অবশ্যই জেনে নাও: রোগীর নাম, ডাক্তারের নাম, তারিখ এবং সময়।
-৩. প্রথমে check_available_slots দিয়ে ফাঁকা সময় চেক করে তারপর book_appointment দিয়ে বুক করো।
-৪. ফোন কলের ক্ষেত্রে উত্তর ১-২ লাইনের মধ্যে রাখবে এবং কোনো স্টার (*) চিহ্ন ব্যবহার করবে না।
+You are a polite clinic receptionist AI helping patients book doctor appointments.
+Available Doctors: {', '.join(DOCTORS.keys())}.
+Rules:
+1. Reply in the same language the patient uses (Bengali, Banglish, or English). Keep replies short and clear.
+2. Before booking, collect: patient name, doctor name, date, and preferred time slot.
+3. First call check_available_slots to verify free slots, then call book_appointment to confirm.
+4. For Phone Calls, keep answers within 1-2 short sentences and do not use markdown or asterisks (*).
 """
 
 user_sessions = {}
@@ -142,7 +142,7 @@ def ask_ai(session_id: str, user_message: str, channel: str, phone: str) -> str:
     messages = user_sessions[session_id]
     messages.append({
         "role": "user",
-        "content": f"[Channel: {channel}, User Phone: {phone}] রোগী বলল: {user_message}"
+        "content": f"[Channel: {channel}, Phone: {phone}] {user_message}"
     })
 
     if len(messages) > 21:
@@ -150,18 +150,27 @@ def ask_ai(session_id: str, user_message: str, channel: str, phone: str) -> str:
         user_sessions[session_id] = messages
 
     try:
-        response = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
-            temperature=0.3,
-            max_tokens=300
-        )
+        try:
+            response = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=messages,
+                tools=TOOLS,
+                tool_choice="auto",
+                temperature=0.3,
+                max_tokens=300
+            )
+        except Exception as tool_err:
+            print("Tool call fallback:", tool_err)
+            response = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=messages,
+                temperature=0.3,
+                max_tokens=300
+            )
 
         response_msg = response.choices[0].message
 
-        if response_msg.tool_calls:
+        if getattr(response_msg, "tool_calls", None):
             messages.append({
                 "role": "assistant",
                 "content": response_msg.content or "",
@@ -195,7 +204,7 @@ def ask_ai(session_id: str, user_message: str, channel: str, phone: str) -> str:
                         channel=channel
                     )
                 else:
-                    result = "অজানা ফাংশন।"
+                    result = "Unknown tool."
 
                 messages.append({
                     "role": "tool",
@@ -222,10 +231,33 @@ def ask_ai(session_id: str, user_message: str, channel: str, phone: str) -> str:
         return "দুঃখিত, একটু টেকনিক্যাল সমস্যা হচ্ছে। কিছুক্ষণ পর আবার চেষ্টা করুন।"
 
 
-# --- ৪. Render Health Check ---
+# --- ৪. হোম ও বুকিং লিস্ট দেখার লিংক ---
 @app.get("/")
 async def home():
     return {"status": "Doctor Booking AI (Groq + Twilio WhatsApp & Call) লাইভ আছে!"}
+
+
+@app.get("/bookings")
+async def view_bookings():
+    conn = sqlite3.connect("appointments.db")
+    c = conn.cursor()
+    c.execute("SELECT id, patient_name, phone, doctor, date, time_slot, channel FROM bookings ORDER BY id DESC")
+    rows = c.fetchall()
+    conn.close()
+    return {
+        "bookings": [
+            {
+                "id": r[0],
+                "patient_name": r[1],
+                "phone": r[2],
+                "doctor": r[3],
+                "date": r[4],
+                "time_slot": r[5],
+                "channel": r[6]
+            }
+            for r in rows
+        ]
+    }
 
 
 # --- ৫. Twilio WhatsApp এন্ডপয়েন্ট ---
@@ -233,14 +265,14 @@ async def home():
 async def twilio_whatsapp(request: Request):
     form = await request.form()
     sender_raw = form.get("From", "Unknown")
-    sender_phone = sender_raw.replace("whatsapp:", "")
-    user_msg = form.get("Body", "").strip()
+    sender_phone = str(sender_raw).replace("whatsapp:", "")
+    user_msg = str(form.get("Body", "")).strip()
 
     resp = MessagingResponse()
     if user_msg:
         reply_text = ask_ai(f"wa_{sender_phone}", user_msg, "WhatsApp", sender_phone)
         resp.message(reply_text)
-    return Response(content=str(resp), media_type="application/xml")
+    return Response(content=str(resp), media_type="application/xml; charset=utf-8")
 
 
 # --- ৬. Twilio Phone Call এন্ডপয়েন্ট ---
@@ -255,21 +287,21 @@ async def incoming_call():
     )
     gather.say("নমস্কার! আমাদের ক্লিনিকে স্বাগতম। আপনি কোন ডাক্তারের অ্যাপয়েন্টমেন্ট বুক করতে চান?", language="bn-IN")
     vr.append(gather)
-    return Response(content=str(vr), media_type="application/xml")
+    return Response(content=str(vr), media_type="application/xml; charset=utf-8")
 
 
 @app.post("/voice/process")
 async def process_call_speech(request: Request):
     form = await request.form()
-    caller_phone = form.get("From", "Unknown")
-    call_sid = form.get("CallSid", caller_phone)
-    user_speech = form.get("SpeechResult", "")
+    caller_phone = str(form.get("From", "Unknown"))
+    call_sid = str(form.get("CallSid", caller_phone))
+    user_speech = str(form.get("SpeechResult", "")).strip()
 
     vr = VoiceResponse()
     if not user_speech:
         vr.say("আমি আপনার কথা শুনতে পাইনি। দয়া করে আবার বলুন।", language="bn-IN")
         vr.redirect("/voice")
-        return Response(content=str(vr), media_type="application/xml")
+        return Response(content=str(vr), media_type="application/xml; charset=utf-8")
 
     ai_reply = ask_ai(f"call_{call_sid}", user_speech, "Phone Call", caller_phone)
 
@@ -281,4 +313,4 @@ async def process_call_speech(request: Request):
     )
     gather.say(ai_reply, language="bn-IN")
     vr.append(gather)
-    return Response(content=str(vr), media_type="application/xml")
+    return Response(content=str(vr), media_type="application/xml; charset=utf-8")
