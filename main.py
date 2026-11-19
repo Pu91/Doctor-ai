@@ -28,7 +28,7 @@ def init_db():
 
 init_db()
 
-# ডাক্তার ও সময়সূচি (ইচ্ছেমতো বদলে নিতে পারেন)
+# ডাক্তার ও সময়সূচি
 DOCTORS = {
     "Dr. Sen (General Physician)": ["10:00 AM", "11:00 AM", "05:00 PM"],
     "Dr. Roy (Dentist)": ["12:00 PM", "04:00 PM", "06:00 PM"],
@@ -78,7 +78,7 @@ def book_appointment(patient_name: str, phone: str, doctor_name: str, date: str,
     return f"Booking Confirmed! ID: #{booking_id}, Patient: {patient_name}, Doctor: {matched_doc}, Date: {date}, Time: {time_slot}."
 
 
-# --- ৩. Groq AI ও টুলস সেটআপ ---
+# --- ৩. Groq অটো-মডেল ও টুলস সেটআপ ---
 TOOLS = [
     {
         "type": "function",
@@ -122,14 +122,55 @@ Rules:
 1. Reply in the same language the patient uses (Bengali, Banglish, or English). Keep replies short and clear.
 2. Before booking, collect: patient name, doctor name, date, and preferred time slot.
 3. First call check_available_slots to verify free slots, then call book_appointment to confirm.
-4. For Phone Calls, keep answers within 1-2 short sentences and do not use markdown or asterisks (*).
+4. Keep answers short (1-3 lines) and do not use markdown asterisks (*).
 """
 
 user_sessions = {}
-MODEL_NAME = "llama-3.3-70b-versatile"
+ACTIVE_MODEL = None
+
+
+def get_active_model(client: Groq) -> str:
+    """আপনার Groq অ্যাকাউন্টে চালু থাকা সেরা চ্যাট মডেলটি নিজে থেকেই খুঁজে নেয়।"""
+    global ACTIVE_MODEL
+    env_model = os.getenv("GROQ_MODEL")
+    if env_model:
+        return env_model
+    if ACTIVE_MODEL:
+        return ACTIVE_MODEL
+
+    models_resp = client.models.list()
+    all_ids = [m.id for m in models_resp.data]
+    print("Available Groq Models:", all_ids)
+
+    blocked = ("whisper", "tts", "guard", "playai", "embed", "rerank", "orpheus", "safeguard", "distil", "compound")
+    chat_models = [m for m in all_ids if not any(b in m.lower() for b in blocked)]
+
+    preferred = [
+        "llama-4-maverick",
+        "llama-4-scout",
+        "llama-3.3-70b",
+        "llama-3.1-8b-instant",
+        "qwen",
+        "gpt-oss",
+        "llama",
+    ]
+    for pref in preferred:
+        for m in chat_models:
+            if pref in m.lower():
+                ACTIVE_MODEL = m
+                print("Selected Groq Model:", ACTIVE_MODEL)
+                return ACTIVE_MODEL
+
+    if chat_models:
+        ACTIVE_MODEL = chat_models[0]
+        print("Fallback Groq Model:", ACTIVE_MODEL)
+        return ACTIVE_MODEL
+
+    raise RuntimeError(f"No usable chat model found. Available: {all_ids}")
 
 
 def ask_ai(session_id: str, user_message: str, channel: str, phone: str) -> str:
+    global ACTIVE_MODEL
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         return "সার্ভারে GROQ_API_KEY সেট করা নেই। Render-এর Environment চেক করুন।"
@@ -150,9 +191,11 @@ def ask_ai(session_id: str, user_message: str, channel: str, phone: str) -> str:
         user_sessions[session_id] = messages
 
     try:
+        model_name = get_active_model(client)
+
         try:
             response = client.chat.completions.create(
-                model=MODEL_NAME,
+                model=model_name,
                 messages=messages,
                 tools=TOOLS,
                 tool_choice="auto",
@@ -162,7 +205,7 @@ def ask_ai(session_id: str, user_message: str, channel: str, phone: str) -> str:
         except Exception as tool_err:
             print("Tool call fallback:", tool_err)
             response = client.chat.completions.create(
-                model=MODEL_NAME,
+                model=model_name,
                 messages=messages,
                 temperature=0.3,
                 max_tokens=300
@@ -214,7 +257,7 @@ def ask_ai(session_id: str, user_message: str, channel: str, phone: str) -> str:
                 })
 
             final_response = client.chat.completions.create(
-                model=MODEL_NAME,
+                model=model_name,
                 messages=messages,
                 temperature=0.3,
                 max_tokens=300
@@ -227,14 +270,21 @@ def ask_ai(session_id: str, user_message: str, channel: str, phone: str) -> str:
         return final_text
 
     except Exception as e:
+        ACTIVE_MODEL = None
         print("Groq Error:", e)
         return "দুঃখিত, একটু টেকনিক্যাল সমস্যা হচ্ছে। কিছুক্ষণ পর আবার চেষ্টা করুন।"
 
 
-# --- ৪. হোম ও বুকিং লিস্ট দেখার লিংক ---
+# --- ৪. হোম, এআই টেস্ট ও বুকিং লিস্ট ---
 @app.get("/")
 async def home():
-    return {"status": "Doctor Booking AI (Groq + Twilio WhatsApp & Call) লাইভ আছে!"}
+    return {"status": "Doctor Booking AI (Groq Auto-Model + Twilio) লাইভ আছে!"}
+
+
+@app.get("/test-ai")
+async def test_ai():
+    reply = ask_ai("browser_test", "Hi, kon kon doctor ache?", "Test", "0000")
+    return {"selected_model": ACTIVE_MODEL, "reply": reply}
 
 
 @app.get("/bookings")
@@ -267,12 +317,14 @@ async def twilio_whatsapp(request: Request):
     sender_raw = form.get("From", "Unknown")
     sender_phone = str(sender_raw).replace("whatsapp:", "")
     user_msg = str(form.get("Body", "")).strip()
+    print(f"WhatsApp In -> From: {sender_phone} | Body: {user_msg}")
 
     resp = MessagingResponse()
     if user_msg:
         reply_text = ask_ai(f"wa_{sender_phone}", user_msg, "WhatsApp", sender_phone)
+        print(f"WhatsApp Out -> {reply_text}")
         resp.message(reply_text)
-    return Response(content=str(resp), media_type="application/xml; charset=utf-8")
+    return Response(content=str(resp), media_type="text/xml")
 
 
 # --- ৬. Twilio Phone Call এন্ডপয়েন্ট ---
@@ -287,7 +339,7 @@ async def incoming_call():
     )
     gather.say("নমস্কার! আমাদের ক্লিনিকে স্বাগতম। আপনি কোন ডাক্তারের অ্যাপয়েন্টমেন্ট বুক করতে চান?", language="bn-IN")
     vr.append(gather)
-    return Response(content=str(vr), media_type="application/xml; charset=utf-8")
+    return Response(content=str(vr), media_type="text/xml")
 
 
 @app.post("/voice/process")
@@ -301,7 +353,7 @@ async def process_call_speech(request: Request):
     if not user_speech:
         vr.say("আমি আপনার কথা শুনতে পাইনি। দয়া করে আবার বলুন।", language="bn-IN")
         vr.redirect("/voice")
-        return Response(content=str(vr), media_type="application/xml; charset=utf-8")
+        return Response(content=str(vr), media_type="text/xml")
 
     ai_reply = ask_ai(f"call_{call_sid}", user_speech, "Phone Call", caller_phone)
 
@@ -313,4 +365,4 @@ async def process_call_speech(request: Request):
     )
     gather.say(ai_reply, language="bn-IN")
     vr.append(gather)
-    return Response(content=str(vr), media_type="application/xml; charset=utf-8")
+    return Response(content=str(vr), media_type="text/xml")
