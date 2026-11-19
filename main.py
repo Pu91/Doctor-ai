@@ -1,7 +1,7 @@
 import os
 import json
 import sqlite3
-from fastapi import FastAPI, Request, Response, BackgroundTasks
+from fastapi import FastAPI, Request, Response, BackgroundTasks, Query
 from groq import Groq
 from twilio.rest import Client as TwilioClient
 from twilio.twiml.voice_response import VoiceResponse, Gather
@@ -36,6 +36,10 @@ DOCTORS = {
     "Dr. Das (Cardiologist)": ["11:30 AM", "03:00 PM"]
 }
 
+# বাংলা ভয়েস সেটিংস (Twilio Google TTS)
+VOICE_NAME = os.getenv("TWILIO_VOICE", "Google.bn-IN-Standard-A")
+VOICE_LANG = os.getenv("TWILIO_LANG", "bn-IN")
+
 # --- ২. বুকিং ও স্লট চেক ফাংশন ---
 def check_available_slots(doctor_name: str, date: str) -> str:
     matched_doc = next((d for d in DOCTORS if doctor_name.lower() in d.lower()), None)
@@ -54,7 +58,7 @@ def check_available_slots(doctor_name: str, date: str) -> str:
     return f"Available slots for {matched_doc} on {date}: {', '.join(free_slots)}"
 
 
-def book_appointment(patient_name: str, phone: str, doctor_name: str, date: str, time_slot: str, channel: str = "WhatsApp") -> str:
+def book_appointment(patient_name: str, phone: str, doctor_name: str, date: str, time_slot: str, channel: str = "Phone Call") -> str:
     matched_doc = next((d for d in DOCTORS if doctor_name.lower() in d.lower()), None)
     if not matched_doc:
         return "Booking failed: Please choose a valid doctor."
@@ -120,10 +124,10 @@ SYSTEM_PROMPT = f"""
 You are a polite clinic receptionist AI helping patients book doctor appointments.
 Available Doctors: {', '.join(DOCTORS.keys())}.
 Rules:
-1. Reply in the same language the patient uses (Bengali, Banglish, or English). Keep replies short and clear.
+1. Reply in Bengali (বাংলা) or the same language the patient uses.
 2. Before booking, collect: patient name, doctor name, date, and preferred time slot.
 3. First call check_available_slots to verify free slots, then call book_appointment to confirm.
-4. Keep answers short (1-3 lines) and do not use markdown asterisks (*).
+4. For Phone Calls, reply in 1-2 short natural spoken sentences in Bengali script. Never use symbols like *, #, or markdown.
 """
 
 user_sessions = {}
@@ -157,7 +161,6 @@ def get_active_model(client: Groq) -> str:
         for m in chat_models:
             if pref in m.lower():
                 ACTIVE_MODEL = m
-                print("Selected Groq Model:", ACTIVE_MODEL)
                 return ACTIVE_MODEL
 
     if chat_models:
@@ -171,7 +174,7 @@ def ask_ai(session_id: str, user_message: str, channel: str, phone: str) -> str:
     global ACTIVE_MODEL
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
-        return "সার্ভারে GROQ_API_KEY সেট করা নেই। Render-এর Environment চেক করুন।"
+        return "সার্ভারে গ্রক এপিআই কী সেট করা নেই।"
 
     client = Groq(api_key=api_key)
 
@@ -198,7 +201,7 @@ def ask_ai(session_id: str, user_message: str, channel: str, phone: str) -> str:
                 tools=TOOLS,
                 tool_choice="auto",
                 temperature=0.3,
-                max_tokens=300
+                max_tokens=250
             )
         except Exception as tool_err:
             print("Tool call fallback:", tool_err)
@@ -206,7 +209,7 @@ def ask_ai(session_id: str, user_message: str, channel: str, phone: str) -> str:
                 model=model_name,
                 messages=messages,
                 temperature=0.3,
-                max_tokens=300
+                max_tokens=250
             )
 
         response_msg = response.choices[0].message
@@ -258,12 +261,13 @@ def ask_ai(session_id: str, user_message: str, channel: str, phone: str) -> str:
                 model=model_name,
                 messages=messages,
                 temperature=0.3,
-                max_tokens=300
+                max_tokens=250
             )
             final_text = final_response.choices[0].message.content or "ধন্যবাদ!"
         else:
             final_text = response_msg.content or "দুঃখিত, বুঝতে পারিনি। দয়া করে আবার বলুন।"
 
+        final_text = final_text.replace("*", "").replace("#", "").strip()
         messages.append({"role": "assistant", "content": final_text})
         return final_text
 
@@ -274,28 +278,21 @@ def ask_ai(session_id: str, user_message: str, channel: str, phone: str) -> str:
 
 
 def send_whatsapp_via_api(from_wa: str, to_wa: str, clean_phone: str, user_msg: str):
-    """ব্যাকগ্রাউন্ডে AI-এর উত্তর তৈরি করে সরাসরি Twilio API দিয়ে WhatsApp-এ পাঠায়।"""
     try:
         reply_text = ask_ai(f"wa_{clean_phone}", user_msg, "WhatsApp", clean_phone)
-        print(f"WhatsApp Out -> {reply_text}")
-
         sid = os.getenv("TWILIO_ACCOUNT_SID")
         token = os.getenv("TWILIO_AUTH_TOKEN")
         twilio_client = TwilioClient(sid, token)
-        sent = twilio_client.messages.create(
-            from_=from_wa,
-            to=to_wa,
-            body=reply_text
-        )
+        sent = twilio_client.messages.create(from_=from_wa, to=to_wa, body=reply_text)
         print(f"Twilio API Sent OK -> SID: {sent.sid}")
     except Exception as e:
         print(f"Twilio API Send Error -> {e}")
 
 
-# --- ৪. হোম, এআই টেস্ট ও বুকিং লিস্ট ---
+# --- ৪. হোম ও বুকিং লিস্ট ---
 @app.get("/")
 async def home():
-    return {"status": "Doctor Booking AI (Groq + Twilio API Direct) লাইভ আছে!"}
+    return {"status": "Doctor Booking AI (Voice Fixed + WhatsApp) লাইভ আছে!"}
 
 
 @app.get("/bookings")
@@ -308,20 +305,92 @@ async def view_bookings():
     return {
         "bookings": [
             {
-                "id": r[0],
-                "patient_name": r[1],
-                "phone": r[2],
-                "doctor": r[3],
-                "date": r[4],
-                "time_slot": r[5],
-                "channel": r[6]
+                "id": r[0], "patient_name": r[1], "phone": r[2],
+                "doctor": r[3], "date": r[4], "time_slot": r[5], "channel": r[6]
             }
             for r in rows
         ]
     }
 
 
-# --- ৫. Twilio WhatsApp এন্ডপয়েন্ট ---
+# --- ৫. AI থেকে আপনার ফোনে ফ্রি কল আনার লিংক ---
+@app.get("/call-me")
+async def trigger_outbound_call(request: Request, to: str = Query(default=None)):
+    sid = os.getenv("TWILIO_ACCOUNT_SID")
+    token = os.getenv("TWILIO_AUTH_TOKEN")
+    from_number = os.getenv("TWILIO_PHONE_NUMBER")
+    to_number = to or os.getenv("MY_PHONE_NUMBER")
+
+    if not all([sid, token, from_number, to_number]):
+        return {
+            "error": "Render-এর Environment-এ TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER এবং MY_PHONE_NUMBER সেট করুন।"
+        }
+
+    voice_url = "https://doctor-ai-dosj.onrender.com/voice"
+    try:
+        twilio_client = TwilioClient(sid, token)
+        call = twilio_client.calls.create(
+            to=to_number,
+            from_=from_number,
+            url=voice_url,
+            method="POST"
+        )
+        return {"status": "কল যাচ্ছে! ফোন রিসিভ করুন।", "call_sid": call.sid}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# --- ৬. Twilio Phone Call এন্ডপয়েন্ট (GET ও POST দুটোই সাপোর্ট করে) ---
+@app.api_route("/voice", methods=["GET", "POST"])
+async def incoming_call():
+    vr = VoiceResponse()
+    gather = Gather(
+        input="speech",
+        action="/voice/process",
+        method="POST",
+        language=VOICE_LANG,
+        speech_timeout="auto"
+    )
+    gather.say(
+        "নমস্কার! আমাদের ক্লিনিকে স্বাগতম। আপনি কোন ডাক্তারের অ্যাপয়েন্টমেন্ট বুক করতে চান?",
+        voice=VOICE_NAME,
+        language=VOICE_LANG
+    )
+    vr.append(gather)
+    vr.say("কোনো উত্তর পাওয়া যায়নি। আবার চেষ্টা করুন।", voice=VOICE_NAME, language=VOICE_LANG)
+    return Response(content=str(vr), media_type="text/xml")
+
+
+@app.api_route("/voice/process", methods=["GET", "POST"])
+async def process_call_speech(request: Request):
+    data = await request.form() if request.method == "POST" else request.query_params
+    caller_phone = str(data.get("From", "Unknown"))
+    call_sid = str(data.get("CallSid", caller_phone))
+    user_speech = str(data.get("SpeechResult", "")).strip()
+    print(f"Call Speech -> {user_speech}")
+
+    vr = VoiceResponse()
+    if not user_speech:
+        vr.say("আমি আপনার কথা শুনতে পাইনি। দয়া করে আবার বলুন।", voice=VOICE_NAME, language=VOICE_LANG)
+        vr.redirect("/voice", method="POST")
+        return Response(content=str(vr), media_type="text/xml")
+
+    ai_reply = ask_ai(f"call_{call_sid}", user_speech, "Phone Call", caller_phone)
+    print(f"Call Reply -> {ai_reply}")
+
+    gather = Gather(
+        input="speech",
+        action="/voice/process",
+        method="POST",
+        language=VOICE_LANG,
+        speech_timeout="auto"
+    )
+    gather.say(ai_reply, voice=VOICE_NAME, language=VOICE_LANG)
+    vr.append(gather)
+    return Response(content=str(vr), media_type="text/xml")
+
+
+# --- ৭. Twilio WhatsApp এন্ডপয়েন্ট ---
 @app.post("/whatsapp")
 async def twilio_whatsapp(request: Request, background_tasks: BackgroundTasks):
     form = await request.form()
@@ -329,63 +398,18 @@ async def twilio_whatsapp(request: Request, background_tasks: BackgroundTasks):
     to_raw = str(form.get("To", "")).strip()
     user_msg = str(form.get("Body", "")).strip()
 
-    print(f"WhatsApp In -> From: {from_raw} | To: {to_raw} | Body: {user_msg}")
-
     if not user_msg:
         return Response(content=str(MessagingResponse()), media_type="text/xml")
 
     clean_phone = from_raw.replace("whatsapp:", "")
 
-    # Twilio API Key সেট থাকলে ব্যাকগ্রাউন্ডে সরাসরি মেসেজ পাঠাবে (টাইমআউট হবে না)
     if os.getenv("TWILIO_ACCOUNT_SID") and os.getenv("TWILIO_AUTH_TOKEN"):
         from_wa = to_raw if to_raw.startswith("whatsapp:") else f"whatsapp:{to_raw}"
         to_wa = from_raw if from_raw.startswith("whatsapp:") else f"whatsapp:{from_raw}"
         background_tasks.add_task(send_whatsapp_via_api, from_wa, to_wa, clean_phone, user_msg)
         return Response(content=str(MessagingResponse()), media_type="text/xml")
 
-    # Fallback: API Key না থাকলে TwiML দিয়ে পাঠাবে
     reply_text = ask_ai(f"wa_{clean_phone}", user_msg, "WhatsApp", clean_phone)
     resp = MessagingResponse()
     resp.message(reply_text)
     return Response(content=str(resp), media_type="text/xml")
-
-
-# --- ৬. Twilio Phone Call এন্ডপয়েন্ট ---
-@app.post("/voice")
-async def incoming_call():
-    vr = VoiceResponse()
-    gather = Gather(
-        input="speech",
-        action="/voice/process",
-        language="bn-IN",
-        speech_timeout="auto"
-    )
-    gather.say("নমস্কার! আমাদের ক্লিনিকে স্বাগতম। আপনি কোন ডাক্তারের অ্যাপয়েন্টমেন্ট বুক করতে চান?", language="bn-IN")
-    vr.append(gather)
-    return Response(content=str(vr), media_type="text/xml")
-
-
-@app.post("/voice/process")
-async def process_call_speech(request: Request):
-    form = await request.form()
-    caller_phone = str(form.get("From", "Unknown"))
-    call_sid = str(form.get("CallSid", caller_phone))
-    user_speech = str(form.get("SpeechResult", "")).strip()
-
-    vr = VoiceResponse()
-    if not user_speech:
-        vr.say("আমি আপনার কথা শুনতে পাইনি। দয়া করে আবার বলুন।", language="bn-IN")
-        vr.redirect("/voice")
-        return Response(content=str(vr), media_type="text/xml")
-
-    ai_reply = ask_ai(f"call_{call_sid}", user_speech, "Phone Call", caller_phone)
-
-    gather = Gather(
-        input="speech",
-        action="/voice/process",
-        language="bn-IN",
-        speech_timeout="auto"
-    )
-    gather.say(ai_reply, language="bn-IN")
-    vr.append(gather)
-    return Response(content=str(vr), media_type="text/xml")
